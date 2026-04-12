@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	iofs "io/fs"
 	"math/rand/v2"
 	"os"
+	"path"
 	"path/filepath"
 	"testing"
 	"time"
@@ -18,26 +18,6 @@ import (
 
 	natsfs "github.com/foohq/ren-natsfs"
 )
-
-func TestFS_Create(t *testing.T) {
-	_, nc := testutils.NewNatsServerAndConnection(t)
-	store := testutils.NewNatsObjectStore(t, nc)
-
-	fs, err := natsfs.NewFS(context.Background(), store)
-	require.NoError(t, err)
-	defer fs.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	err = fs.Wait(ctx)
-	require.NoError(t, err)
-
-	_, err = fs.Create("/test.txt")
-	require.NoError(t, err)
-
-	_, err = fs.Stat("/test.txt")
-	require.NoError(t, err)
-}
 
 func TestFS_Mkdir(t *testing.T) {
 	_, nc := testutils.NewNatsServerAndConnection(t)
@@ -59,7 +39,8 @@ func TestFS_Mkdir(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, info.IsDir())
 
-	_, err = fs.Create("/dir/file")
+	_, err = fs.OpenFile("/dir/file", os.O_WRONLY|os.O_CREATE, 0644)
+	require.NoError(t, err)
 	require.NoError(t, err)
 
 	_, err = fs.Stat("/dir/file")
@@ -94,7 +75,8 @@ func TestFS_MkdirAll(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, info.IsDir())
 
-	_, err = fs.Create("/dir/file")
+	_, err = fs.OpenFile("/dir/file", os.O_WRONLY|os.O_CREATE, 0644)
+	require.NoError(t, err)
 	require.NoError(t, err)
 
 	_, err = fs.Stat("/dir/file")
@@ -105,7 +87,7 @@ func TestFS_MkdirAll(t *testing.T) {
 	require.False(t, info.IsDir())
 }
 
-func TestFS_Open(t *testing.T) {
+func TestFS_MkdirTemp(t *testing.T) {
 	_, nc := testutils.NewNatsServerAndConnection(t)
 	store := testutils.NewNatsObjectStore(t, nc)
 
@@ -118,13 +100,20 @@ func TestFS_Open(t *testing.T) {
 	err = fs.Wait(ctx)
 	require.NoError(t, err)
 
-	err = fs.WriteFile("/test.txt", nil, 0644)
+	dir, err := fs.MkdirTemp("", "testdir*")
+	require.NoError(t, err)
+	require.NotEmpty(t, dir)
+
+	info, err := fs.Stat(dir)
+	require.NoError(t, err)
+	require.True(t, info.IsDir())
+
+	_, err = fs.OpenFile(path.Join(dir, "test"), os.O_WRONLY|os.O_CREATE, 0644)
 	require.NoError(t, err)
 
-	f, err := fs.Open("/test.txt")
+	info, err = fs.Stat(path.Join(dir, "test"))
 	require.NoError(t, err)
-	err = f.Close()
-	require.NoError(t, err)
+	require.False(t, info.IsDir())
 }
 
 func TestFS_OpenFile(t *testing.T) {
@@ -498,42 +487,6 @@ func TestFS_ReadDir(t *testing.T) {
 	}
 }
 
-func TestFS_WalkDir(t *testing.T) {
-	_, nc := testutils.NewNatsServerAndConnection(t)
-	store := testutils.NewNatsObjectStore(t, nc)
-
-	fs, err := natsfs.NewFS(context.Background(), store)
-	require.NoError(t, err)
-	defer fs.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	err = fs.Wait(ctx)
-	require.NoError(t, err)
-
-	err = fs.WriteFile("test/a.txt", []byte("a"), 0644)
-	require.NoError(t, err)
-	err = fs.WriteFile("test/sub/b.txt", []byte("b"), 0644)
-	require.NoError(t, err)
-
-	var paths []string
-	err = fs.WalkDir("test", func(path string, d iofs.DirEntry, err error) error {
-		require.NoError(t, err)
-		if d.IsDir() {
-			_, err = fs.ReadDir(path)
-		} else {
-			_, err = fs.ReadFile(path)
-		}
-		require.NoError(t, err)
-		paths = append(paths, path)
-		return nil
-	})
-	require.NoError(t, err)
-
-	expected := []string{"/test", "/test/a.txt", "/test/sub", "/test/sub/b.txt"}
-	require.ElementsMatch(t, expected, paths)
-}
-
 func TestFS_Close(t *testing.T) {
 	_, nc := testutils.NewNatsServerAndConnection(t)
 	store := testutils.NewNatsObjectStore(t, nc)
@@ -550,6 +503,6 @@ func TestFS_Close(t *testing.T) {
 	err = fs.Close()
 	require.NoError(t, err)
 
-	_, err = fs.Open("/test.txt")
-	require.Error(t, err) // Should fail due to canceled context
+	_, err = fs.OpenFile("/test.txt", os.O_RDONLY|os.O_CREATE, 0)
+	require.Error(t, err)
 }
