@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/foohq/ren"
 	"github.com/nats-io/nats.go/jetstream"
-	risoros "github.com/risor-io/risor/os"
 
 	memfs "github.com/foohq/ren-memfs"
 )
@@ -25,6 +25,8 @@ var (
 	ErrBadDescriptor        = errors.New("bad descriptor")
 	ErrNotSynced            = errors.New("filesystem not synchronized")
 )
+
+var _ ren.FS = (*FS)(nil)
 
 type FS struct {
 	cache   *memfs.FS
@@ -103,13 +105,8 @@ func (fs *FS) watchUpdates() {
 	}
 }
 
-// Create creates a new file (NATS + cache structure)
-func (fs *FS) Create(name string) (risoros.File, error) {
-	return fs.OpenFile(name, risoros.O_RDWR|risoros.O_CREATE|risoros.O_TRUNC, 0666)
-}
-
 // Mkdir returns an error as explicit directory creation is not supported
-func (fs *FS) Mkdir(name string, perm risoros.FileMode) error {
+func (fs *FS) Mkdir(name string, perm ren.FileMode) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -133,7 +130,7 @@ func (fs *FS) Mkdir(name string, perm risoros.FileMode) error {
 }
 
 // MkdirAll returns an error as explicit directory creation is not supported
-func (fs *FS) MkdirAll(pth string, perm risoros.FileMode) error {
+func (fs *FS) MkdirAll(pth string, perm ren.FileMode) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -156,7 +153,30 @@ func (fs *FS) MkdirAll(pth string, perm risoros.FileMode) error {
 	return nil
 }
 
-func (fs *FS) mkdirCache(pth string, perm risoros.FileMode) (func(), error) {
+// MkdirTemp creates a new temporary directory in the directory dir
+// and returns the pathname of the new directory.
+func (fs *FS) MkdirTemp(dir, pattern string) (string, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if !fs.isSynced() {
+		return "", ErrNotSynced
+	}
+
+	pth, revert, err := fs.mkdirTempCache(dir, pattern)
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := fs.store.Put(fs.ctx, newObjectMetadata(pth, typeDir), strings.NewReader("")); err != nil {
+		revert()
+		return "", &Error{err}
+	}
+
+	return pth, nil
+}
+
+func (fs *FS) mkdirCache(pth string, perm ren.FileMode) (func(), error) {
 	err := fs.cache.Mkdir(pth, perm)
 	if err != nil {
 		return nil, err
@@ -169,7 +189,7 @@ func (fs *FS) mkdirCache(pth string, perm risoros.FileMode) (func(), error) {
 	return revertFn, nil
 }
 
-func (fs *FS) mkdirAllCache(pth string, perm risoros.FileMode) (func(), error) {
+func (fs *FS) mkdirAllCache(pth string, perm ren.FileMode) (func(), error) {
 	var createdDirs []string
 	var parentDir string
 
@@ -196,7 +216,20 @@ func (fs *FS) mkdirAllCache(pth string, perm risoros.FileMode) (func(), error) {
 	return revertFn, nil
 }
 
-func (fs *FS) writeFileCache(name string, data []byte, perm risoros.FileMode) (func(), error) {
+func (fs *FS) mkdirTempCache(dir, pattern string) (string, func(), error) {
+	pth, err := fs.cache.MkdirTemp(dir, pattern)
+	if err != nil {
+		return "", nil, err
+	}
+
+	revertFn := func() {
+		_ = fs.cache.Remove(pth)
+	}
+
+	return pth, revertFn, nil
+}
+
+func (fs *FS) writeFileCache(name string, data []byte, perm ren.FileMode) (func(), error) {
 	if err := fs.cache.WriteFile(name, data, perm); err != nil {
 		return nil, err
 	}
@@ -208,13 +241,8 @@ func (fs *FS) writeFileCache(name string, data []byte, perm risoros.FileMode) (f
 	return revertFn, nil
 }
 
-// Open opens a file for reading (fetches content from NATS)
-func (fs *FS) Open(name string) (risoros.File, error) {
-	return fs.OpenFile(name, risoros.O_RDONLY, 0)
-}
-
 // OpenFile opens a file with specified flags (cache structure + NATS for content)
-func (fs *FS) OpenFile(name string, flag int, perm risoros.FileMode) (risoros.File, error) {
+func (fs *FS) OpenFile(name string, flag int, perm ren.FileMode) (ren.File, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -231,11 +259,11 @@ func (fs *FS) OpenFile(name string, flag int, perm risoros.FileMode) (risoros.Fi
 	}
 
 	exists := err == nil
-	if !exists && flag&risoros.O_CREATE == 0 {
+	if !exists && flag&os.O_CREATE == 0 {
 		return nil, ErrNotExist
 	}
 
-	if flag&risoros.O_CREATE != 0 {
+	if flag&os.O_CREATE != 0 {
 		revertDirs, err := fs.mkdirCache(path.Dir(pth), 0755)
 		if err != nil && !errors.Is(err, memfs.ErrExist) {
 			return nil, err
@@ -267,7 +295,7 @@ func (fs *FS) OpenFile(name string, flag int, perm risoros.FileMode) (risoros.Fi
 
 	// Fetch content from NATS for reading
 	var o jetstream.ObjectResult
-	if flag&risoros.O_WRONLY == 0 {
+	if flag&os.O_WRONLY == 0 {
 		o, err = fs.store.Get(fs.ctx, pth)
 		if err != nil {
 			if !errors.Is(err, jetstream.ErrObjectNotFound) || !info.IsDir() {
@@ -287,7 +315,7 @@ func (fs *FS) OpenFile(name string, flag int, perm risoros.FileMode) (risoros.Fi
 
 // ReadFile reads the entire contents of a file from NATS
 func (fs *FS) ReadFile(name string) ([]byte, error) {
-	f, err := fs.OpenFile(name, risoros.O_RDONLY, 0)
+	f, err := fs.OpenFile(name, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -376,7 +404,7 @@ func (fs *FS) Rename(oldpath, newpath string) error {
 }
 
 // Stat returns file information (cache only)
-func (fs *FS) Stat(name string) (risoros.FileInfo, error) {
+func (fs *FS) Stat(name string) (ren.FileInfo, error) {
 	if !fs.isSynced() {
 		return nil, ErrNotSynced
 	}
@@ -390,8 +418,8 @@ func (fs *FS) Symlink(oldname, newname string) error {
 }
 
 // WriteFile writes data to a file
-func (fs *FS) WriteFile(name string, data []byte, perm risoros.FileMode) error {
-	f, err := fs.OpenFile(name, risoros.O_WRONLY|risoros.O_CREATE, perm)
+func (fs *FS) WriteFile(name string, data []byte, perm ren.FileMode) error {
+	f, err := fs.OpenFile(name, os.O_WRONLY|os.O_CREATE, perm)
 	if err != nil {
 		return err
 	}
@@ -406,22 +434,13 @@ func (fs *FS) WriteFile(name string, data []byte, perm risoros.FileMode) error {
 }
 
 // ReadDir reads directory contents from the cache
-func (fs *FS) ReadDir(name string) ([]risoros.DirEntry, error) {
+func (fs *FS) ReadDir(name string) ([]ren.DirEntry, error) {
 	if !fs.isSynced() {
 		return nil, ErrNotSynced
 	}
 
 	name = cleanPath(name)
 	return fs.cache.ReadDir(name)
-}
-
-// WalkDir walks the directory tree in the cache
-func (fs *FS) WalkDir(root string, fn risoros.WalkDirFunc) error {
-	if !fs.isSynced() {
-		return ErrNotSynced
-	}
-
-	return fs.cache.WalkDir(cleanPath(root), fn)
 }
 
 // Close shuts down the filesystem
@@ -459,7 +478,7 @@ var (
 
 // natsFile wraps a memfs.FS file to sync writes back to NATS
 type natsFile struct {
-	risoros.File
+	ren.File
 	fs      *FS
 	flag    int
 	path    string
@@ -470,7 +489,7 @@ type natsFile struct {
 }
 
 func (f *natsFile) Read(b []byte) (int, error) {
-	if f.flag&risoros.O_WRONLY != 0 {
+	if f.flag&os.O_WRONLY != 0 {
 		return 0, ErrBadDescriptor
 	}
 
@@ -481,7 +500,7 @@ func (f *natsFile) Read(b []byte) (int, error) {
 	return f.obj.Read(b)
 }
 
-func (f *natsFile) Stat() (risoros.FileInfo, error) {
+func (f *natsFile) Stat() (ren.FileInfo, error) {
 	if f.obj != nil {
 		info, err := f.obj.Info()
 		if err != nil {
@@ -496,7 +515,7 @@ func (f *natsFile) Stat() (risoros.FileInfo, error) {
 
 // Write overrides the underlying file write to sync to NATS
 func (f *natsFile) Write(b []byte) (int, error) {
-	if f.flag&risoros.O_WRONLY == 0 && f.flag&risoros.O_RDWR == 0 {
+	if f.flag&os.O_WRONLY == 0 && f.flag&os.O_RDWR == 0 {
 		return 0, ErrBadDescriptor
 	}
 
@@ -591,7 +610,7 @@ func (f *fileInfo) Size() int64 {
 	return int64(f.info.Size)
 }
 
-func (f *fileInfo) Mode() risoros.FileMode {
+func (f *fileInfo) Mode() ren.FileMode {
 	return 0666
 }
 
